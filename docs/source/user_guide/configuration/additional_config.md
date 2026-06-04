@@ -125,6 +125,8 @@ The details of each configuration option are as follows:
 | `embedding_tensor_parallel_size` | int  | `0` | The custom tensor parallel size of embedding. |
 | `mlp_tensor_parallel_size`       | int  | `0` | The custom tensor parallel size of mlp.       |
 
+(ascend-compilation-config)=
+
 **ascend_compilation_config**
 
 | Name | Type | Default | Description |

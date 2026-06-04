@@ -286,25 +286,31 @@ Sections 1–5 above focus on the host OS, CANN/HCCL, and `torch_npu`. This sect
 
 Model-specific commands and benchmark numbers stay in [model deployment tutorials](../../tutorials/models/index.md). Option semantics and compatibility matrices are in the [Feature Guide](../../user_guide/feature_guide/index.md) and [Additional Configuration](../../user_guide/configuration/additional_config.md).
 
+(ascend-tuning-workflow)=
+
 ### 6.1 Tuning workflow
 
 Use the same workflow for every change:
 
 1. **Define the scenario and metrics** — throughput (tokens/s), TTFT, TPOT, max concurrency, memory headroom, and whether traffic is prefill-heavy or decode-heavy.
-2. **Classify the primary bottleneck** — use [Section 6.2](#6-2-classify-the-primary-bottleneck) (one dominant category is enough to start).
+2. **Classify the primary bottleneck** — use [Section 6.2](ascend-tuning-bottleneck) (one dominant category is enough to start).
 3. **Change one tuning option at a time** — keep topology, weights, and unrelated flags fixed; compare A/B on the same benchmark.
 4. **Re-measure and record constraints** — note mutual exclusions (for example, `enforce_eager` vs graph mode, FlashComm1 vs small batches, batch invariant vs some Ascend options).
 
+(ascend-tuning-bottleneck)=
+
 ### 6.2 Classify the primary bottleneck
 
-Match your symptoms to **one** row below. That row tells you which subsection in [Section 6.3](#6-3-tuning-options-by-bottleneck-class) to read first.
+Match your symptoms to **one** row below. That row tells you which subsection in [Section 6.3](ascend-tuning-options) to read first.
 
 | Symptoms (what you see in metrics or profiling) | Bottleneck class | Read first |
 |-------------------------------------------------|------------------|------------|
-| Decode QPS is low while batch size is already moderate; CPU scheduler or Python host path is hot; per-token latency varies a lot step to step | **Runtime overhead** | [§6.3.1](#6-3-1-runtime-overhead-graph-and-scheduling) |
-| Adding TP ranks does not scale throughput; large prefill steps spend much time in HCCL; very long prompts OOM or have high TTFT | **Parallelism and communication** | [§6.3.2](#6-3-2-parallelism-and-communication) |
-| Linear layers show high MTE time or are clearly memory-bound; changing quant format or weight layout moves the needle | **Compute and memory bandwidth** | [§6.3.3](#6-3-3-compute-and-memory-bandwidth) |
-| Raising `max-num-seqs` or `max-num-batched-tokens` causes OOM; throughput stays flat because each long prompt is split into many small prefill steps; scheduling feels memory- or token-cap bound (if APC is on but prompts still pay full prefill, check prefix overlap and APC settings—not only batch caps) | **Capacity and batching** | [§6.3.4](#6-3-4-capacity-and-batching) |
+| Decode QPS is low while batch size is already moderate; CPU scheduler or Python host path is hot; per-token latency varies a lot step to step | **Runtime overhead** | [§6.3.1](ascend-tuning-runtime) |
+| Adding TP ranks does not scale throughput; large prefill steps spend much time in HCCL; very long prompts OOM or have high TTFT | **Parallelism and communication** | [§6.3.2](ascend-tuning-parallelism) |
+| Linear layers show high MTE time or are clearly memory-bound; changing quant format or weight layout moves the needle | **Compute and memory bandwidth** | [§6.3.3](ascend-tuning-compute) |
+| Raising `max-num-seqs` or `max-num-batched-tokens` causes OOM; throughput stays flat because each long prompt is split into many small prefill steps; scheduling feels memory- or token-cap bound (if APC is on but prompts still pay full prefill, check prefix overlap and APC settings—not only batch caps) | **Capacity and batching** | [§6.3.4](ascend-tuning-capacity) |
+
+(ascend-tuning-options)=
 
 ### 6.3 Tuning options by bottleneck class
 
@@ -315,6 +321,8 @@ Each table uses the same columns:
 - **Mechanism** — what the stack actually does (one sentence).
 - **How to enable** — `Default` or explicit flag/CLI.
 - **When not to use** — common mistakes.
+
+(ascend-tuning-runtime)=
 
 #### 6.3.1 Runtime overhead (graph and scheduling)
 
@@ -327,7 +335,7 @@ Graph-mode rows below apply to the [**V1 engine**](../../user_guide/feature_guid
 | [**AddRMSNormQuant fusion**](../../user_guide/configuration/additional_config.md#ascend-compilation-config) | Extra memory traffic around norm + quant | Fuses add, RMSNorm, and quant into fewer kernels | **Default** via `fuse_norm_quant` in `ascend_compilation_config` when compile is active | `enforce_eager=True` or graph/compile disabled; Ascend 310P (pass not applied); turning off passes without a reason |
 | [**QKNorm–Rope fusion**](../../user_guide/configuration/additional_config.md#ascend-compilation-config) | Kernel launch and memory traffic around QK norm + RoPE | Fuses QK norm and RoPE when shapes match (for example, `head_dim == 128`) | **Default** where supported (`fuse_qknorm_rope`) when compile is active; set `false` if Triton is unavailable | Same as AddRMSNormQuant for eager/compile; models or dtypes the pass does not support |
 | [**Graph mode (ACLGraph; Npugraph_ex on FULL paths)**](../../user_guide/feature_guide/graph_mode.md) | Per-step launch and Python scheduling overhead | ACLGraph captures and replays the execution graph; on `FULL` / `FULL_DECODE_ONLY`, Npugraph_ex rewrites the FX graph **before** capture (it does not replace ACLGraph). Default `FULL_AND_PIECEWISE` uses ACLGraph without that Npugraph_ex path | `--compilation-config` (for example, `"cudagraph_mode": "FULL_DECODE_ONLY"`) | Non–V1 engine; `enforce_eager=True`; some context-parallel + `FULL` combinations — see [Graph Mode Guide](../../user_guide/feature_guide/graph_mode.md) |
-| [**`cudagraph_capture_sizes`**](https://docs.vllm.ai/en/latest/design/cuda_graphs/) | Padding waste when a step’s token count falls between captured buckets | Each entry is a **batch token count** (`num_tokens` after bucketing) for which a graph is captured; runtime steps round **up** to the next listed size (or fall back to eager if above the max) | List sizes in `--compilation-config` from profiling or scheduler logs; see [ACL Graph — capture sizes](../Design_Documents/ACL_Graph.md#capture-sizes-and-bucketing) | Misaligned buckets; with [FlashComm1 (FC1)](#6-3-2-parallelism-and-communication), entries must be **multiples of TP** (filtered at init). [SP Pass](../../user_guide/feature_guide/sequence_parallelism.md) also requires token counts aligned to TP—see that guide |
+| [**`cudagraph_capture_sizes`**](https://docs.vllm.ai/en/latest/design/cuda_graphs/) | Padding waste when a step’s token count falls between captured buckets | Each entry is a **batch token count** (`num_tokens` after bucketing) for which a graph is captured; runtime steps round **up** to the next listed size (or fall back to eager if above the max) | List sizes in `--compilation-config` from profiling or scheduler logs; see [ACL Graph — capture sizes](../Design_Documents/ACL_Graph.md#capture-sizes-and-bucketing) | Misaligned buckets; with [FlashComm1 (FC1)](ascend-tuning-parallelism), entries must be **multiples of TP** (filtered at init). [SP Pass](../../user_guide/feature_guide/sequence_parallelism.md) also requires token counts aligned to TP—see that guide |
 | [**`--async-scheduling`**](https://docs.vllm.ai/en/latest/configuration/engine_args/#async-scheduling-no-async-scheduling) | CPU becomes the limiter at high concurrency | Overlaps scheduling work with NPU execution | CLI flag (`--async-scheduling`) | Check interaction with speculative decoding, pipeline parallel, and batch-invariant mode |
 
 **Example — graph mode:**
@@ -336,6 +344,8 @@ Graph-mode rows below apply to the [**V1 engine**](../../user_guide/feature_guid
 vllm serve Qwen/Qwen3-8B \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
 ```
+
+(ascend-tuning-parallelism)=
 
 #### 6.3.2 Parallelism and communication
 
@@ -353,7 +363,7 @@ vllm serve Qwen/Qwen3-8B \
 | [**Fine-grained TP**](../../user_guide/feature_guide/Fine_grained_TP.md) | Uneven comm across modules (lm_head, MLP, embedding) | Different TP widths per module | [`finegrained_tp_config`](../../user_guide/configuration/additional_config.md) in `--additional-config` | Before basic TP size is sane |
 | [**Layer sharding**](../../user_guide/feature_guide/layer_sharding.md) | Full-layer weights too large (often PD prefill node) | Shards selected linear layers across ranks | [`layer_sharding`](../../user_guide/configuration/additional_config.md) in `--additional-config` (PD prefill / P role per feature guide) | Outside [PD-disaggregated prefill (P node)](../../user_guide/feature_guide/layer_sharding.md); colocated single-node jobs with enough memory and no layer-shard need |
 
-**Suggested order:** (1) fix TP/EP/PP/PD topology → (2) long context → try PCP/DCP → (3) VL → SP Pass in graph mode → (4) non-VL TP workloads → FC1 when batch tokens are large enough (dense models: often ~1000+; MoE may apply without that cap—see your model guide) → (5) set `cudagraph_capture_sizes` to the **padded token counts** you see in graph-mode steps (multiples of TP when [FlashComm1 (FC1)](#6-3-2-parallelism-and-communication) is on).
+**Suggested order:** (1) fix TP/EP/PP/PD topology → (2) long context → try PCP/DCP → (3) VL → SP Pass in graph mode → (4) non-VL TP workloads → FC1 when batch tokens are large enough (dense models: often ~1000+; MoE may apply without that cap—see your model guide) → (5) set `cudagraph_capture_sizes` to the **padded token counts** you see in graph-mode steps (multiples of TP when [FlashComm1 (FC1)](ascend-tuning-parallelism) is on).
 
 **Example — FlashComm1:**
 
@@ -362,6 +372,8 @@ vllm serve Qwen/Qwen3-32B \
   --tensor-parallel-size 4 \
   --additional-config '{"enable_flashcomm1": true}'
 ```
+
+(ascend-tuning-compute)=
 
 #### 6.3.3 Compute and memory bandwidth
 
@@ -372,9 +384,11 @@ vllm serve Qwen/Qwen3-32B \
 | [**Weight prefetch**](../../user_guide/feature_guide/weight_prefetch.md) | MTE stalls before large linear layers | A side pipeline issues **CMO** prefetches into L2 while vector ops (RMSNorm, SwiGLU, etc.) run on another pipeline | [`weight_prefetch_config`](../../user_guide/configuration/additional_config.md) in `--additional-config` | **Throughput** serving only: prefetch uses vector time to hide DMA—wrong `prefetch_ratio` hurts latency and can slow the model; confirm overlap on the profiling timeline before raising ratios; keep off for low-latency SLOs; graph path should be stable first; MLP `down` prefetch requires **sequence parallel to be active** ([SP Pass](../../user_guide/feature_guide/sequence_parallelism.md) or [FlashComm1](../../user_guide/feature_guide/sequence_parallelism.md#difference-between-sp-and-flash-comm-v1)—see the prefetch guide) |
 | [**`weight_nz_mode`**](../../user_guide/configuration/additional_config.md) | Cube efficiency on weight layout | Stores weights in **FRACTAL_NZ** when allowed (`0` off, `1` quant only, `2` aggressive) | `--additional-config '{"weight_nz_mode": 1}'` (default **1**) | Expecting it to fix HCCL bottlenecks |
 | [**Quantization (W8A8, W4A8, …)**](../../user_guide/feature_guide/quantization.md) | Arithmetic and collective volume | Lower precision kernels and smaller transfers | Model-specific quant flags and weights | Without accuracy validation; MoE paths may need [`enable_mlapo`](../../user_guide/configuration/additional_config.md) or [`enable_fused_mc2`](../../user_guide/configuration/additional_config.md) per model guide |
-| [**`enable_mlapo`** (MoE)](../../user_guide/configuration/additional_config.md) | DeepSeek-class W8A8 layer execution | Layer-wise adaptive parallel layout; trades **more NPU memory** for speed | Default **on**; disable via `--additional-config '{"enable_mlapo": false}'` if memory is tighter than latency |
+| [**`enable_mlapo`** (MoE)](../../user_guide/configuration/additional_config.md) | DeepSeek-class W8A8 layer execution | Layer-wise adaptive parallel layout; trades **more NPU memory** for speed | Default **on**; disable via `--additional-config '{"enable_mlapo": false}'` | When memory is tighter than latency |
 | [**`enable_fused_mc2`** (MoE)](../../user_guide/configuration/additional_config.md) | MoE dispatch/combine overhead | Replaces default ALLTOALL+MC2 with fused operators under strict constraints | `--additional-config '{"enable_fused_mc2": 1}'` or `2` | Wrong PD role, EP size, or MTP dtype — see [Large-scale EP](../../user_guide/feature_guide/large_scale_ep.md) |
 | [**EPLB** (MoE)](../../user_guide/feature_guide/eplb_swift_balancer.md) | Hot experts on fixed EP layout | Rebalances expert placement from heat maps | [`eplb_config`](../../user_guide/configuration/additional_config.md) in `--additional-config` | Small EP jobs where overhead dominates |
+
+(ascend-tuning-capacity)=
 
 #### 6.3.4 Capacity and batching
 
@@ -391,4 +405,3 @@ vllm serve Qwen/Qwen3-32B \
 | [**Dynamic batch**](../../user_guide/feature_guide/dynamic_batch.md) / [**`enable_balance_scheduling`**](../../user_guide/configuration/additional_config.md) | Uneven load across time or ranks | SLO-driven chunk sizing or Ascend balance scheduler | `--SLO_limits_for_dynamic_batch` (see [dynamic batch](../../user_guide/feature_guide/dynamic_batch.md)); balance scheduling via `--additional-config` | Until baseline batching is stable |
 
 Set `max-num-batched-tokens` and `max-num-seqs` to a **stable, non-OOM** point before tuning graph capture lists or FlashComm1.
-
