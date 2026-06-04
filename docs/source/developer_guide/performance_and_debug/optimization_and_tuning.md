@@ -321,7 +321,7 @@ Each table uses the same columns:
 (ascend-tuning-runtime)=
 #### 6.3.1 Runtime overhead (graph and scheduling)
 
-**Bottleneck class:** framework dispatch, graph capture mismatch, and CPU-side scheduling—not NPU math or HCCL volume.
+**Bottleneck class:** framework dispatch, graph capture mismatch, and CPU-side scheduling overhead.
 
 | Option | Addresses | Mechanism | How to enable | When not to use |
 |--------|-----------|-----------|---------------|-----------------|
@@ -343,7 +343,7 @@ vllm serve Qwen/Qwen3-8B \
 (ascend-tuning-parallelism)=
 #### 6.3.2 Parallelism and communication
 
-**Bottleneck class:** tensor-parallel collectives, long-sequence partitioning, or weights that do not fit on one rank—not operator fusion on a single card.
+**Bottleneck class:** tensor-parallel collectives, long-sequence partitioning, and weights spread across ranks.
 
 **These three solve different problems—do not pick one as a substitute for another.** FC1/SP target TP Norm comm; PCP/DCP target sequence length. Some model guides still forbid certain combinations (for example, FC1 with PCP/DCP on specific architectures).
 
@@ -372,7 +372,7 @@ vllm serve Qwen/Qwen3-32B \
 (ascend-tuning-bandwidth)=
 #### 6.3.3 Compute and memory bandwidth
 
-**Bottleneck class:** moving weights (MTE), layout-friendly math on Cube, and MoE dispatch—not how many requests fit in a batch.
+**Bottleneck class:** weight movement (MTE), layout-friendly math on Cube, and MoE dispatch/combine.
 
 | Option | Addresses | Mechanism | How to enable | When not to use |
 |--------|-----------|-----------|---------------|-----------------|
@@ -386,7 +386,7 @@ vllm serve Qwen/Qwen3-32B \
 (ascend-tuning-capacity)=
 #### 6.3.4 Capacity and batching
 
-**Bottleneck class:** how many tokens and sequences you can admit per step, how prefill is chunked, and where KV lives—not per-layer fusion.
+**Bottleneck class:** token and sequence admission per step, prefill chunking, and KV storage placement.
 
 | Option | Addresses | Mechanism | How to enable | When not to use |
 |--------|-----------|-----------|---------------|-----------------|
@@ -399,32 +399,4 @@ vllm serve Qwen/Qwen3-32B \
 | [**Dynamic batch**](../../user_guide/feature_guide/dynamic_batch.md) / [**`enable_balance_scheduling`**](../../user_guide/configuration/additional_config.md) | Uneven load across time or ranks | SLO-driven chunk sizing or Ascend balance scheduler | `SLO_limits_for_dynamic_batch` / `--additional-config` | Until baseline batching is stable |
 
 Set `max-num-batched-tokens` and `max-num-seqs` to a **stable, non-OOM** point before tuning graph capture lists or FlashComm1.
-
-### 6.4 Suggested tuning sequence (generic)
-
-Use this as **order of decisions**, not a list of features to enable together:
-
-1. Parallel topology (TP / EP / PP, PD or colocated)
-2. Capacity (`max-num-batched-tokens`, `max-num-seqs`; chunked prefill / APC if needed)
-3. Runtime (default fusions are already on; then graph mode + `cudagraph_capture_sizes`; `--async-scheduling` if CPU-bound)
-4. Parallelism options (long context → PCP/DCP; VL → SP Pass; else large-batch TP → FC1)
-5. Bandwidth (quant, `weight_nz_mode`; optional [weight prefetch](../../user_guide/feature_guide/weight_prefetch.md) only when maximizing throughput—use [profiling](service_profiling_guide.md) to verify prefetch CMO overlaps the paired vector op before tuning `prefetch_ratio`)
-
-**Example — graph and batch stable, then FC1:**
-
-```bash
-vllm serve Qwen/Qwen3-32B \
-  --tensor-parallel-size 4 \
-  --max-num-seqs 64 \
-  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [64]}' \
-  --additional-config '{"enable_flashcomm1": true}'
-```
-
-**What to put in `cudagraph_capture_sizes`:** each value is a **batch token count** for graph capture/replay bucketing, not `max-num-seqs` by itself.
-
-- **Uniform decode** (`FULL_DECODE_ONLY`): use the padded `num_tokens` per step. Often `active_requests × uniform_decode_query_len`, where `uniform_decode_query_len` is `1 + num_speculative_tokens` (see [ACL Graph](../Design_Documents/ACL_Graph.md#capture-sizes-and-bucketing) and Ascend default `max_num_seqs × decode_query_len`, capped at 512). Example: 64 active sequences with no spec decode → list `64`; with 3 speculative tokens per step → list `64 × 4 = 256`, not `64`.
-- **Prefill or mixed batches:** use the **scheduled tokens in that step** (up to `max-num-batched-tokens`), not decode concurrency alone.
-- **FC1 / SP:** every listed size must be a **multiple of TP**; others are dropped at init.
-
-If the runtime token count is not in the list, vLLM pads up to the next bucket (extra compute). If it exceeds the largest entry, graph mode is skipped for that step.
 
