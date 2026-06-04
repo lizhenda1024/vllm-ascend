@@ -417,3 +417,56 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+## Cursor Cloud specific instructions
+
+This repository is the **vLLM Ascend hardware plugin** (not a standalone server). Lint and CPU unit tests can run on a generic Linux VM; **NPU E2E inference and `vllm serve` require Ascend hardware, CANN, and device nodes** (`/dev/davinci*`, etc.). See [Testing](docs/source/developer_guide/contribution/testing.md).
+
+### Environment layout
+
+| Path | Purpose |
+|------|---------|
+| `/workspace/.venv` | Project virtualenv (create with `python3 -m venv .venv`) |
+| `/workspace/vllm-project/vllm` | Upstream vLLM checkout (tag should match `docs/source/conf.py` → `vllm_version`, currently `v0.20.2`) |
+
+On Ubuntu without `python3-venv`: `sudo apt-get install -y python3.12-venv`.
+
+### One-time setup (CPU / lint / UT)
+
+```bash
+source /workspace/.venv/bin/activate   # after creating .venv
+
+# Lint
+pip install -r requirements-lint.txt
+
+# vLLM (empty device build — no GPU/NPU required for import/UT)
+mkdir -p /workspace/vllm-project && cd /workspace/vllm-project
+git clone --depth 1 --branch v0.20.2 https://github.com/vllm-project/vllm.git   # skip if present
+cd vllm && VLLM_TARGET_DEVICE=empty pip install . && pip uninstall -y triton
+
+# vllm-ascend (skip CANN kernel build on CPU-only hosts)
+cd /workspace
+export SOC_VERSION=ascend910b1
+export COMPILE_CUSTOM_KERNELS=0
+pip install setuptools-scm attrs decorator einops numpy packaging pybind11 pyyaml regex scipy pandas psutil
+pip install -e . --no-deps --no-build-isolation
+pip install pytest pytest-mock pytest-asyncio torchvision
+```
+
+`triton-ascend`, `torch-npu`, and full `requirements.txt` wheels are **Ascend-specific** and may not install from public PyPI on x86. CPU unit tests mock `torch_npu` via `tests/ut/conftest.py`; do not expect `from vllm.platforms import current_platform` to work outside pytest without real `torch_npu`.
+
+### Commands (activate `.venv` first)
+
+| Task | Command |
+|------|---------|
+| Lint (CI parity) | `bash format.sh ci` (from repo root; needs `requirements-lint.txt`) |
+| Ruff only | `ruff check vllm_ascend/` / `ruff format vllm_ascend/` |
+| CPU unit tests | `export SOC_VERSION=ascend910b1 COMPILE_CUSTOM_KERNELS=0 TORCH_DEVICE_BACKEND_AUTOLOAD=0` then `pytest -sv tests/ut/_tools/` or other `tests/ut/<module>/` paths **without** `a2/`, `a3_*`, or `310p/` subdirs |
+| NPU tests / serve | Ascend container or host with CANN + NPU devices; see upstream [installation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html) |
+
+### Gotchas
+
+- **`SOC_VERSION` is mandatory** when `npu-smi` is absent (see `setup.py`).
+- Set **`COMPILE_CUSTOM_KERNELS=0`** on CPU-only VMs to avoid CMake/CANN native builds.
+- **`pip install -e .` without `--no-deps`** pulls `triton-ascend` and fails on generic x86 PyPI.
+- Full `pip install -r requirements-dev.txt` is intended for **Linux + Ascend** CI images, not generic cloud VMs.
