@@ -330,7 +330,7 @@ Each table uses the same columns:
 | [**Zero-like elimination**](../../tutorials/models/Qwen3-Dense.md#zerolike-elimination) | Useless tensor ops before attention matmuls | Removes zero-like ops from the attention forward path | **Default** on supported paths | N/A for most users |
 | [**QKNorm–Rope fusion**](../../user_guide/configuration/additional_config.md#ascend-compilation-config) | Kernel launch and memory traffic around QK norm + RoPE | Fuses QK norm and RoPE when shapes match (for example, `head_dim == 128`) | **Default** where supported (`fuse_qknorm_rope`); set `false` if Triton is unavailable | Models or dtypes the pass does not support |
 | [**Graph mode (ACLGraph; Npugraph_ex on FULL paths)**](../../user_guide/feature_guide/graph_mode.md) | Per-step launch and Python scheduling overhead | ACLGraph captures and replays the execution graph; on `FULL` / `FULL_DECODE_ONLY`, Npugraph_ex rewrites the FX graph **before** capture (it does not replace ACLGraph). Default `FULL_AND_PIECEWISE` uses ACLGraph without that Npugraph_ex path | `--compilation-config` (for example, `"cudagraph_mode": "FULL_DECODE_ONLY"`) | `enforce_eager=True`; some context-parallel + `FULL` combinations — see [Graph Mode Guide](../../user_guide/feature_guide/graph_mode.md) |
-| [**`cudagraph_capture_sizes`**](https://docs.vllm.ai/en/latest/design/cuda_graphs/) | Padding waste when batch token count falls between captured sizes | Pre-captures graphs only for listed token counts; other counts round up to the next size | List sizes in `--compilation-config` after target concurrency is known; see also [ACL Graph](../Design_Documents/ACL_Graph.md) | Sizes not aligned with real traffic; with {ref}`FlashComm1 <flashcomm1-fc1>`, entries should be **multiples of TP** (others are dropped) |
+| [**`cudagraph_capture_sizes`**](https://docs.vllm.ai/en/latest/design/cuda_graphs/) | Padding waste when a step’s token count falls between captured buckets | Each entry is a **batch token count** (`num_tokens` after bucketing) for which a graph is captured; runtime steps round **up** to the next listed size (or fall back to eager if above the max) | List sizes in `--compilation-config` from profiling or scheduler logs; see [ACL Graph — capture sizes](../Design_Documents/ACL_Graph.md#capture-sizes-and-bucketing) | Misaligned buckets; with {ref}`FlashComm1 <flashcomm1-fc1>` or SP, entries must be **multiples of TP** (filtered at init) |
 | [**`--async-scheduling`**](https://docs.vllm.ai/en/latest/configuration/engine_args/#async-scheduling-no-async-scheduling) | CPU becomes the limiter at high concurrency | Overlaps scheduling work with NPU execution | CLI flag; see also [Qwen3 Dense — async scheduling](../../tutorials/models/Qwen3-Dense.md#asynchronous-scheduling) | Check interaction with speculative decoding, pipeline parallel, and batch-invariant mode |
 
 **Example — graph mode:**
@@ -359,7 +359,7 @@ vllm serve Qwen/Qwen3-8B \
 | [**Fine-grained TP**](../../user_guide/feature_guide/Fine_grained_TP.md) | Uneven comm across modules (lm_head, MLP, embedding) | Different TP widths per module | [`finegrained_tp_config`](../../user_guide/configuration/additional_config.md) in `--additional-config` | Before basic TP size is sane |
 | [**Layer sharding**](../../user_guide/feature_guide/layer_sharding.md) | Full-layer weights too large (often PD prefill node) | Shards selected linear layers across ranks | [`layer_sharding`](../../user_guide/configuration/additional_config.md) in `--additional-config` (PD scenarios) | Dense single-node jobs with enough memory |
 
-**Suggested order:** (1) fix TP/EP/PP/PD topology → (2) long context → try PCP/DCP → (3) VL → SP Pass in graph mode → (4) non-VL large TP batches → FC1 only if token count exceeds threshold → (5) align `cudagraph_capture_sizes` with TP if FC1 is on.
+**Suggested order:** (1) fix TP/EP/PP/PD topology → (2) long context → try PCP/DCP → (3) VL → SP Pass in graph mode → (4) non-VL large TP batches → FC1 only if token count exceeds threshold → (5) set `cudagraph_capture_sizes` to the **padded token counts** you see in graph-mode steps (multiples of TP if FC1/SP is on).
 
 **Example — FlashComm1:**
 
@@ -420,5 +420,11 @@ vllm serve Qwen/Qwen3-32B \
   --additional-config '{"enable_flashcomm1": true}'
 ```
 
-Set `cudagraph_capture_sizes` to the **token counts your scheduler actually runs** in graph mode (often correlated with concurrency, but not always equal to `max-num-seqs`). With FC1 enabled, use multiples of TP.
+**What to put in `cudagraph_capture_sizes`:** each value is a **batch token count** for graph capture/replay bucketing, not `max-num-seqs` by itself.
+
+- **Uniform decode** (`FULL_DECODE_ONLY`): use the padded `num_tokens` per step. Often `active_requests × uniform_decode_query_len`, where `uniform_decode_query_len` is `1 + num_speculative_tokens` (see [ACL Graph](../Design_Documents/ACL_Graph.md#capture-sizes-and-bucketing) and Ascend default `max_num_seqs × decode_query_len`, capped at 512). Example: 64 active sequences with no spec decode → list `64`; with 3 speculative tokens per step → list `64 × 4 = 256`, not `64`.
+- **Prefill or mixed batches:** use the **scheduled tokens in that step** (up to `max-num-batched-tokens`), not decode concurrency alone.
+- **FC1 / SP:** every listed size must be a **multiple of TP**; others are dropped at init.
+
+If the runtime token count is not in the list, vLLM pads up to the next bucket (extra compute). If it exceeds the largest entry, graph mode is skipped for that step.
 
