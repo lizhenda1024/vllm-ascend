@@ -107,6 +107,7 @@ If you encounter any problems while contributing, feel free to submit a PR to im
 :::{toctree}
 :caption: Index
 :maxdepth: 1
+submitting_changes
 testing
 doc_writing
 multi_node_test
