@@ -12,6 +12,7 @@
 # Features:
 # - Load balances requests to multiple prefiller and decoder servers.
 # - Supports OpenAI-compatible /v1/completions and /v1/chat/completions endpoints.
+# - Forwards vLLM Tokenizer API (/tokenize, /detokenize) to count prompt tokens.
 # - Streams responses from backend servers to clients.
 #
 # Prerequisites:
@@ -77,6 +78,23 @@
 # This will return a JSON object with the status and the number of prefiller
 # and decoder instances.
 #
+# Step 4b: Count Prompt Tokens (Tokenizer API)
+# --------------------------------------------
+# vLLM exposes /tokenize (not under /v1) to tokenize text or chat messages.
+# The proxy forwards these requests to a backend prefiller (or decoder) node:
+#
+#   curl -X POST http://localhost:9000/tokenize \
+#     -H "Content-Type: application/json" \
+#     -d '{"prompt": "The quick brown fox jumps over the lazy dog"}'
+#
+# Chat-style input (uses the same chat template as inference):
+#
+#   curl -X POST http://localhost:9000/tokenize \
+#     -H "Content-Type: application/json" \
+#     -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+#
+# Response fields include `count` (token count), `tokens`, and `max_model_len`.
+#
 # Step 5: Add or Remove Prefiller or Decoder Instances (Optional)
 # ---------------------------------------------------------------
 # You can add or remove prefiller or decoder instances after the proxy is started.
@@ -128,8 +146,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 
 try:
     from vllm.logger import init_logger
@@ -158,15 +176,27 @@ class InstanceType:
 TAINT_PRIORITY = 1e15
 
 
+def build_root_url(host: str, port: int) -> str:
+    try:
+        ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv6Address):
+            return f"http://[{host}]:{port}"
+    except Exception:
+        pass
+    return f"http://{host}:{port}"
+
+
 class ServerState:
     def __init__(self, host, port):
         self.host = host
         self.port = port
-        self.url = f"http://{host}:{port}/v1"
+        self.root_url = build_root_url(host, port)
+        self.url = f"{self.root_url}/v1"
         try:
             ip = ipaddress.ip_address(self.host)
             if isinstance(ip, ipaddress.IPv6Address):
                 self.url = f"http://[{host}]:{port}/v1"
+                self.root_url = f"http://[{host}]:{port}"
         except Exception:
             pass
         self.client = httpx.AsyncClient(
@@ -213,6 +243,16 @@ class ProxyState:
         self.decoder_heap = [(0.0, i, server) for i, server in enumerate(self.decoders)]
         heapq.heapify(self.prefiller_heap)
         heapq.heapify(self.decoder_heap)
+        self.tokenizer_rr_counter = 0
+
+    def select_tokenizer_backend(self) -> ServerState:
+        """Pick a backend for stateless tokenizer API calls (no PD load accounting)."""
+        servers = self.prefillers or self.decoders
+        if not servers:
+            raise RuntimeError("No backend servers available for tokenizer API")
+        idx = self.tokenizer_rr_counter % len(servers)
+        self.tokenizer_rr_counter += 1
+        return servers[idx]
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -523,6 +563,12 @@ def parse_args():
         type=float,
         default=10,
         help="Check interval (seconds) for waiting nodes to be started",
+    )
+    parser.add_argument(
+        "--tokenizer-timeout",
+        type=float,
+        default=60.0,
+        help="Timeout (seconds) for forwarded /tokenize and /detokenize requests",
     )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
@@ -887,6 +933,66 @@ def trans_instances(instances: list[str]) -> list[ServerState]:
         h, p = instance.split(":")
         server_list.append(ServerState(h, int(p)))
     return server_list
+
+
+def _build_forward_headers(request: Request) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    auth = request.headers.get("authorization")
+    if auth:
+        headers["Authorization"] = auth
+    elif os.environ.get("OPENAI_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ.get('OPENAI_API_KEY')}"
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+async def _forward_tokenizer_api(path: str, request: Request) -> Response:
+    """Forward vLLM tokenizer endpoints (/tokenize, /detokenize, /tokenizer_info)."""
+    try:
+        backend = proxy_state.select_tokenizer_backend()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    url = f"{backend.root_url}{path}"
+    headers = _build_forward_headers(request)
+    body = await request.body() if request.method in {"POST", "PUT", "PATCH"} else None
+
+    try:
+        response = await backend.client.request(
+            request.method,
+            url,
+            content=body,
+            headers=headers,
+            timeout=global_args.tokenizer_timeout,
+        )
+    except httpx.RequestError as e:
+        logger.error("Tokenizer API forward to %s failed: %s", url, e)
+        raise HTTPException(status_code=502, detail=f"Backend tokenizer request failed: {e}") from e
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type"),
+    )
+
+
+@app.post("/tokenize")
+@with_cancellation
+async def handle_tokenize(request: Request):
+    return await _forward_tokenizer_api("/tokenize", request)
+
+
+@app.post("/detokenize")
+@with_cancellation
+async def handle_detokenize(request: Request):
+    return await _forward_tokenizer_api("/detokenize", request)
+
+
+@app.get("/tokenizer_info")
+async def handle_tokenizer_info(request: Request):
+    return await _forward_tokenizer_api("/tokenizer_info", request)
 
 
 @app.post("/v1/completions")
